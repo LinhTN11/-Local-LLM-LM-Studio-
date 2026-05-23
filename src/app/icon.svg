@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200" role="img" aria-label="Logo">
+  <defs>
+    <ellipse id="petal" cx="100" cy="100" rx="90" ry="22" />
+  </defs>
+  <g fill="#D46B4F" fill-rule="evenodd">
+    <use href="#petal" transform="rotate(0 100 100)" />
+    <use href="#petal" transform="rotate(45 100 100)" />
+    <use href="#petal" transform="rotate(90 100 100)" />
+    <use href="#petal" transform="rotate(135 100 100)" />
+  </g>
+</svg>
