@@ -4,6 +4,7 @@ import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react'
 import katex from 'katex';
 import type { Highlighter } from 'shiki';
 import ClaudeChatInput from './ui/claude-style-chat-input';
+import { useAdaptiveThinking } from '@/hooks/useAdaptiveThinking';
 import { 
     Loader2, 
     RotateCcw, 
@@ -19,7 +20,8 @@ import {
     ChevronRight,
     ChevronLeft,
     MessageCircle,
-    Check
+    Check,
+    Paperclip
 } from 'lucide-react';
 
 interface AttachedFile {
@@ -37,12 +39,24 @@ interface PastedSnippet {
     timestamp: Date;
 }
 
+interface ClarificationQuestion {
+    message: string;
+    suggestions: string[];
+}
+
 interface Message {
     role: 'user' | 'assistant' | 'system';
     content: string;
     timestamp?: string;
     versions?: string[];
     activeVersion?: number;
+    images?: (string | { url: string, name: string })[];
+    isClarification?: boolean;
+    suggestions?: string[];
+    message?: string;
+    intro?: string;
+    questions?: ClarificationQuestion[];
+    answeredQuestions?: Record<number, string>;
 }
 
 interface Model {
@@ -118,6 +132,62 @@ const isLikelyVietnamese = (text: string) => {
 };
 
 const removeUnrequestedEmoji = (text: string) => text.replace(EMOJI_REGEX, '').replace(/[ \t]{2,}/g, ' ');
+
+const fileToBase64 = (file: File): Promise<string> => {
+    return new Promise((resolve, reject) => {
+        // If it's not an image, read it as-is
+        if (!file.type.startsWith('image/')) {
+            const reader = new FileReader();
+            reader.readAsDataURL(file);
+            reader.onload = () => resolve(reader.result as string);
+            reader.onerror = error => reject(error);
+            return;
+        }
+
+        // Compress and resize images
+        const reader = new FileReader();
+        reader.readAsDataURL(file);
+        reader.onload = (event) => {
+            const img = new Image();
+            img.src = event.target?.result as string;
+            img.onload = () => {
+                const canvas = document.createElement('canvas');
+                const MAX_WIDTH = 1024;
+                const MAX_HEIGHT = 1024;
+                let width = img.width;
+                let height = img.height;
+
+                if (width > height) {
+                    if (width > MAX_WIDTH) {
+                        height *= MAX_WIDTH / width;
+                        width = MAX_WIDTH;
+                    }
+                } else {
+                    if (height > MAX_HEIGHT) {
+                        width *= MAX_HEIGHT / height;
+                        height = MAX_HEIGHT;
+                    }
+                }
+
+                canvas.width = width;
+                canvas.height = height;
+                const ctx = canvas.getContext('2d');
+                if (!ctx) {
+                    resolve(event.target?.result as string); // fallback to original if context fails
+                    return;
+                }
+                ctx.drawImage(img, 0, 0, width, height);
+                // Export as JPEG with 0.8 quality
+                const dataUrl = canvas.toDataURL('image/jpeg', 0.8);
+                resolve(dataUrl);
+            };
+            img.onerror = (err) => {
+                reject(err);
+            };
+        };
+        reader.onerror = error => reject(error);
+    });
+};
 
 // Custom lightweight robust Markdown Renderer
 interface MarkdownRendererProps {
@@ -610,6 +680,7 @@ const ChatboxDemo = () => {
     const [sessions, setSessions] = useState<ChatSession[]>(initialSessions);
     const [activeSessionId, setActiveSessionId] = useState<string>('session-1');
     const [isSidebarOpen, setIsSidebarOpen] = useState<boolean>(true);
+    const [fullscreenImage, setFullscreenImage] = useState<string | { url: string, name: string } | null>(null);
     
     // Search Dialog States
     const [isSearchOpen, setIsSearchOpen] = useState<boolean>(false);
@@ -620,7 +691,7 @@ const ChatboxDemo = () => {
     const [isConnected, setIsConnected] = useState(false);
     const [models, setModels] = useState<Model[]>(DEFAULT_MODELS);
     const [selectedModel, setSelectedModel] = useState("sonnet-4.6");
-    const [isThinkingEnabled, setIsThinkingEnabled] = useState(false); // Default OFF
+    const { modelTier, forceThinking, setForceThinking, send } = useAdaptiveThinking(selectedModel);
     const [isLoadingModel, setIsLoadingModel] = useState<boolean>(false);
     const [loadingModelName, setLoadingModelName] = useState<string>("");
 
@@ -768,6 +839,7 @@ const ChatboxDemo = () => {
 
     // Active thoughts expand
     const [showThoughts, setShowThoughts] = useState<Record<number, boolean>>({});
+    const [activeClarificationPage, setActiveClarificationPage] = useState<Record<number, number>>({});
 
     const chatEndRef = useRef<HTMLDivElement>(null);
     const editAreaRef = useRef<HTMLTextAreaElement>(null);
@@ -985,16 +1057,30 @@ const ChatboxDemo = () => {
             files: AttachedFile[];
             pastedContent: PastedSnippet[];
             model: string;
-            isThinkingEnabled: boolean;
+            forceThinking: string | null;
         },
         customHistory?: Message[],
         targetAssistantIndex?: number
     ) => {
         if (targetAssistantIndex === undefined && !data.message.trim() && data.files.length === 0 && data.pastedContent.length === 0) return;
 
+        // Convert image files to base64 strings
+        const imageFiles = data.files.filter(f => f.type.startsWith('image/') || (f.preview && f.type.startsWith('image/')));
+        let base64Images: { url: string, name: string }[] = [];
+        try {
+            const base64Promises = imageFiles.map(async f => {
+                const url = await fileToBase64(f.file);
+                return { url, name: f.file.name };
+            });
+            base64Images = await Promise.all(base64Promises);
+        } catch (err) {
+            console.error('Error converting images to base64:', err);
+        }
+
         let fullUserText = data.message;
-        if (data.files.length > 0) {
-            fullUserText += `\n\n*(Uploaded ${data.files.length} file(s): ${data.files.map(f => f.file.name).join(', ')})*`;
+        const nonImageFiles = data.files.filter(f => !(f.type.startsWith('image/') || (f.preview && f.type.startsWith('image/'))));
+        if (nonImageFiles.length > 0) {
+            fullUserText += `\n\n*(Uploaded ${nonImageFiles.length} file(s): ${nonImageFiles.map(f => f.file.name).join(', ')})*`;
         }
         if (data.pastedContent.length > 0) {
             fullUserText += `\n\n*(Attached ${data.pastedContent.length} pasted text snippet(s))*`;
@@ -1005,7 +1091,12 @@ const ChatboxDemo = () => {
         
         const newMessages: Message[] = [
             ...baseHistory,
-            { role: 'user', content: fullUserText, timestamp: timeStr }
+            { 
+                role: 'user', 
+                content: fullUserText, 
+                timestamp: timeStr,
+                images: base64Images.length > 0 ? base64Images : undefined
+            }
         ];
 
         // If targetAssistantIndex is provided, we use the session history up to targetAssistantIndex
@@ -1016,7 +1107,7 @@ const ChatboxDemo = () => {
         if (targetAssistantIndex === undefined) {
             // Auto update session title if it's currently a new chat
             const updatedTitle = activeSession.title === 'New chat' 
-                ? (data.message.length > 30 ? data.message.slice(0, 30) + '...' : data.message)
+                ? (data.message.trim().length > 0 ? (data.message.trim().length > 30 ? data.message.trim().slice(0, 30) : data.message.trim()) : "New chat")
                 : activeSession.title;
 
             setSessions(prev => prev.map(s => {
@@ -1039,47 +1130,19 @@ const ChatboxDemo = () => {
         const systemPromptBase = (systemPromptTemplate || DEFAULT_SYSTEM_PROMPT_TEMPLATE)
             .replaceAll('{{language}}', isVietnamese ? 'Vietnamese' : 'same as query')
             .replaceAll('{{detectLang}}', detectLang);
-        const systemPrompt = data.isThinkingEnabled
-            ? systemPromptBase
-            : `${systemPromptBase}\n\nIMPORTANT:\n* Do not include hidden reasoning or <think> blocks. Respond directly with the final answer.`;
+        const systemPrompt = systemPromptBase;
 
         setIsGenerating(true);
 
         try {
-            if (data.isThinkingEnabled) {
-                promptMessages.unshift({
-                    role: 'system',
-                    content: systemPrompt + `\n3. START with a deep, step-by-step reasoning thought process block enclosed exactly between <think> and </think> tags. The thought process MUST be strictly in ${detectLang}.`
-                });
-            } else {
-                promptMessages.unshift({
-                    role: 'system',
-                    content: systemPrompt
-                });
-            }
+            promptMessages.unshift({
+                role: 'system',
+                content: systemPrompt
+            });
 
             abortControllerRef.current = new AbortController();
 
-            const response = await fetch('/api/chat', {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                },
-                body: JSON.stringify({
-                    model: data.model,
-                    messages: promptMessages.map(m => ({ role: m.role, content: m.content })),
-                    stream: true
-                }),
-                signal: abortControllerRef.current.signal
-            });
-
-            if (!response.ok) {
-                throw new Error('Failed to fetch completion from LM Studio');
-            }
-
-            const reader = response.body?.getReader();
-            const decoder = new TextDecoder();
-            if (!reader) throw new Error('No stream reader available');
+            // API Call will happen below using send()
 
             const assistantMsgIndex = targetAssistantIndex !== undefined ? targetAssistantIndex : newMessages.length;
             
@@ -1127,12 +1190,6 @@ const ChatboxDemo = () => {
                 const accumulatedResponse = streamResponseRef.current;
                 const accumulatedReasoning = streamReasoningRef.current;
 
-                if (!data.isThinkingEnabled) {
-                    if (accumulatedResponse.length > 0) return accumulatedResponse;
-                    if (!accumulatedReasoning) return '';
-                    return extractFinalAnswer(accumulatedReasoning);
-                }
-
                 if (!accumulatedReasoning) return accumulatedResponse;
                 if (accumulatedResponse.length === 0) return `<think>${accumulatedReasoning}`;
 
@@ -1140,7 +1197,7 @@ const ChatboxDemo = () => {
                 return `<think>${accumulatedReasoning}</think>\n${cleanResponse}`;
             };
 
-            const flushAssistantMessage = () => {
+            const flushAssistantMessage = (isFinal = false) => {
                 if (streamFlushTimerRef.current) {
                     clearTimeout(streamFlushTimerRef.current);
                     streamFlushTimerRef.current = null;
@@ -1150,6 +1207,17 @@ const ChatboxDemo = () => {
                 setSessions(prev => prev.map(s => {
                     if (s.id === activeSessionId) {
                         const updatedMsgList = [...s.messages];
+                        let updatedTitle = s.title;
+
+                        if (isFinal && (!s.title || s.title === 'New chat')) {
+                            const cleanText = streamResponseRef.current.replace(/<\/?think>/gi, '').trim();
+                            if (cleanText) {
+                                updatedTitle = cleanText.length > 30 ? cleanText.slice(0, 30) : cleanText;
+                            } else if (!s.title) {
+                                updatedTitle = "Image Analysis";
+                            }
+                        }
+
                         if (updatedMsgList.length > assistantMsgIndex && updatedMsgList[assistantMsgIndex].role === 'assistant') {
                             const existingMsg = updatedMsgList[assistantMsgIndex];
                             const currentVersions = existingMsg.versions || [''];
@@ -1166,6 +1234,7 @@ const ChatboxDemo = () => {
                         }
                         return {
                             ...s,
+                            title: updatedTitle,
                             messages: updatedMsgList
                         };
                     }
@@ -1178,67 +1247,78 @@ const ChatboxDemo = () => {
                 streamFlushTimerRef.current = setTimeout(flushAssistantMessage, 50);
             };
 
-            let sseBuffer = '';
-
-            while (true) {
-                const { done, value } = await reader.read();
-                if (done) break;
-
-                sseBuffer += decoder.decode(value, { stream: true });
-                const lines = sseBuffer.split('\n');
-                sseBuffer = lines.pop() || '';
-
-                for (const line of lines) {
-                    const trimmedLine = line.trim();
-                    if (!trimmedLine) continue;
-
-                    if (trimmedLine.startsWith('data: ')) {
-                        const dataStr = trimmedLine.slice(6).trim();
-                        if (dataStr === '[DONE]') continue;
-
-                        try {
-                            const parsed = JSON.parse(dataStr);
-                            const delta = parsed.choices?.[0]?.delta;
-                            const content = delta?.content || '';
-                            const reasoning = delta?.reasoning_content || '';
-
-                            const safeContent = data.isThinkingEnabled
-                                ? content
-                                : content.replace(/<\/?think>/gi, '');
-
-                            streamResponseRef.current += removeUnrequestedEmoji(safeContent);
-                            streamReasoningRef.current += removeUnrequestedEmoji(reasoning);
-                            scheduleAssistantFlush();
-                        } catch (e) {
-                            console.warn('SSE parse error - incomplete chunk:', dataStr, e);
-                        }
-                    }
+            // Prepare format for API
+            const apiMessages = promptMessages.map(m => {
+                if (m.role === 'user' && m.images && m.images.length > 0) {
+                    const contentArray: any[] = [
+                        { type: 'text', text: m.content }
+                    ];
+                    m.images.forEach(imgBase64 => {
+                        contentArray.push({
+                            type: 'image_url',
+                            image_url: {
+                                url: typeof imgBase64 === 'string' ? imgBase64 : (imgBase64 as any).url
+                            }
+                        });
+                    });
+                    return { role: m.role, content: contentArray };
                 }
-            }
+                return { role: m.role, content: m.content };
+            });
 
-            sseBuffer += decoder.decode();
-            if (sseBuffer.trim()) {
-                const trimmedLine = sseBuffer.trim();
-                if (trimmedLine.startsWith('data: ')) {
-                    const dataStr = trimmedLine.slice(6).trim();
-                    if (dataStr !== '[DONE]') {
-                        try {
-                            const parsed = JSON.parse(dataStr);
-                            const delta = parsed.choices?.[0]?.delta;
-                            const content = delta?.content || '';
-                            const reasoning = delta?.reasoning_content || '';
-                            const safeContent = data.isThinkingEnabled
-                                ? content
-                                : content.replace(/<\/?think>/gi, '');
-                            streamResponseRef.current += removeUnrequestedEmoji(safeContent);
-                            streamReasoningRef.current += removeUnrequestedEmoji(reasoning);
-                        } catch {
-                            // Ignore trailing incomplete data
+            await send(apiMessages, {
+                onClarify: (data: any) => {
+                    // Build questions array (backward compat with old format)
+                    const questions: ClarificationQuestion[] = data.questions && data.questions.length > 0
+                        ? data.questions
+                        : (data.message && data.suggestions ? [{ message: data.message, suggestions: data.suggestions }] : []);
+                    
+                    const firstQ = questions[0];
+                    const displayContent = firstQ?.message || data.message || '';
+                    streamResponseRef.current = displayContent;
+                    
+                    setSessions(prev => prev.map(s => {
+                        if (s.id === activeSessionId) {
+                            const updatedMsgList = [...s.messages];
+                            const existingMsg = updatedMsgList[assistantMsgIndex];
+                            updatedMsgList[assistantMsgIndex] = {
+                                ...existingMsg,
+                                content: displayContent,
+                                versions: [displayContent],
+                                activeVersion: 0,
+                                isClarification: true,
+                                message: displayContent,
+                                intro: data.intro || '',
+                                questions: questions,
+                                answeredQuestions: {},
+                                suggestions: firstQ?.suggestions || data.suggestions || []
+                            };
+                            return { ...s, messages: updatedMsgList };
                         }
+                        return s;
+                    }));
+                },
+                onThinkingChunk: (chunk: string) => {
+                    streamReasoningRef.current += removeUnrequestedEmoji(chunk);
+                    scheduleAssistantFlush();
+                },
+                onTextChunk: (chunk: string) => {
+                    streamResponseRef.current += removeUnrequestedEmoji(chunk);
+                    scheduleAssistantFlush();
+                },
+                onDone: (result: any) => {
+                    if (result.aborted) {
+                        console.log('Generation aborted by user');
+                    } else {
+                        flushAssistantMessage(true);
                     }
+                },
+                onError: (err: Error) => {
+                    throw err;
                 }
-            }
-            flushAssistantMessage();
+            }, {
+                signal: abortControllerRef.current.signal
+            });
         } catch (error: unknown) {
             if (error instanceof Error && error.name === 'AbortError') {
                 console.log('Generation aborted by user');
@@ -1323,7 +1403,7 @@ const ChatboxDemo = () => {
             files: [],
             pastedContent: [],
             model: selectedModel,
-            isThinkingEnabled: isThinkingEnabled
+            forceThinking: forceThinking
         }, truncatedHistory);
     };
 
@@ -1362,7 +1442,7 @@ const ChatboxDemo = () => {
             files: [],
             pastedContent: [],
             model: selectedModel,
-            isThinkingEnabled: isThinkingEnabled
+            forceThinking: forceThinking
         }, undefined, messageIndex);
     };
 
@@ -1382,7 +1462,7 @@ const ChatboxDemo = () => {
             files: [],
             pastedContent: [],
             model: selectedModel,
-            isThinkingEnabled: isThinkingEnabled
+            forceThinking: forceThinking
         }, truncatedHistory);
     };
 
@@ -1856,8 +1936,9 @@ const ChatboxDemo = () => {
                                     models={models}
                                     selectedModel={selectedModel}
                                     onSelectModel={handleSelectModel}
-                                    isThinkingEnabled={isThinkingEnabled}
-                                    onToggleThinking={() => setIsThinkingEnabled(!isThinkingEnabled)}
+                                    forceThinking={forceThinking}
+                                    setForceThinking={(v: string | null) => setForceThinking(v as any)}
+                                    modelTier={modelTier}
                                     isLoadingModel={isLoadingModel}
                                     loadingModelName={loadingModelName}
                                     isGenerating={isGenerating}
@@ -1910,9 +1991,33 @@ const ChatboxDemo = () => {
                                                 </div>
                                             ) : (
                                                 <>
-                                                    {/* User Bubble - Capsule style */}
-                                                    <div className="bg-[#2a2a29] border-none text-[#ececec] rounded-2xl px-4 py-2 text-[15px] font-normal max-w-[85%] font-sans shadow-sm select-text">
-                                                        {normalizedContent}
+                                                    {/* User Bubble Container */}
+                                                    <div className="flex flex-col items-end max-w-[85%] gap-2">
+                                                        {msg.images && msg.images.length > 0 && (
+                                                            <div className="flex flex-wrap justify-end gap-2 select-none">
+                                                                {msg.images.map((img, imgIdx) => {
+                                                                    const isObj = typeof img === 'object' && img !== null;
+                                                                    const url = isObj ? (img as any).url : img as string;
+                                                                    return (
+                                                                    <div 
+                                                                        key={imgIdx} 
+                                                                        onClick={() => setFullscreenImage(img)}
+                                                                        className="relative w-48 h-48 rounded-xl overflow-hidden border-2 border-[#D46B4F] group/img cursor-pointer shadow-sm transition-opacity hover:opacity-90"
+                                                                    >
+                                                                        <img 
+                                                                            src={url} 
+                                                                            alt="Attached image" 
+                                                                            className="object-cover w-full h-full" 
+                                                                        />
+                                                                    </div>
+                                                                )})}
+                                                            </div>
+                                                        )}
+                                                        {normalizedContent && (
+                                                            <div className="bg-[#2a2a29] border-none text-[#ececec] rounded-2xl px-4 py-2 text-[15px] font-normal font-sans shadow-sm select-text self-end">
+                                                                <div className="whitespace-pre-wrap leading-relaxed">{normalizedContent}</div>
+                                                            </div>
+                                                        )}
                                                     </div>
                                                     
                                                     {/* User Actions */}
@@ -1995,7 +2100,226 @@ const ChatboxDemo = () => {
                                             {/* Assistant response with rich custom Markdown Rendering */}
                                             {normalizedResponse && (
                                                 <div className="max-w-[95%] pl-1 w-full">
-                                                    <MarkdownRenderer text={normalizedResponse} />
+                                                    {!msg.isClarification && (
+                                                        <MarkdownRenderer text={normalizedResponse} />
+                                                    )}
+                                                    
+                                                    {msg.isClarification && msg.intro && (
+                                                        <div className="mb-3">
+                                                            <MarkdownRenderer text={msg.intro} />
+                                                        </div>
+                                                    )}
+                                                    
+                                                    {msg.isClarification && (() => {
+                                                        const questions = msg.questions || (msg.suggestions && msg.suggestions.length > 0 ? [{ message: msg.message || normalizedResponse, suggestions: msg.suggestions }] : []);
+                                                        if (questions.length === 0) return null;
+                                                        
+                                                        const totalQ = questions.length;
+                                                        const currentPage = activeClarificationPage[index] ?? 0;
+                                                        const currentQ = questions[currentPage];
+                                                        if (!currentQ) return null;
+                                                        
+                                                        const isAnswered = !!(msg.answeredQuestions && msg.answeredQuestions[currentPage]);
+                                                        const allAnswered = !!(msg.answeredQuestions && Object.keys(msg.answeredQuestions).length >= totalQ);
+                                                        
+                                                        const handleSelectOption = (optionText: string, qIdx: number) => {
+                                                            // Build the updated answers map (including this new answer)
+                                                            const updatedAnswers: Record<number, string> = {
+                                                                ...(msg.answeredQuestions || {}),
+                                                                [qIdx]: optionText
+                                                            };
+                                                            
+                                                            // Mark this question as answered in state
+                                                            setSessions(prev => prev.map(s => {
+                                                                if (s.id === activeSessionId) {
+                                                                    const updatedMsgList = [...s.messages];
+                                                                    const existingMsg = updatedMsgList[index];
+                                                                    updatedMsgList[index] = {
+                                                                        ...existingMsg,
+                                                                        answeredQuestions: updatedAnswers
+                                                                    };
+                                                                    return { ...s, messages: updatedMsgList };
+                                                                }
+                                                                return s;
+                                                            }));
+                                                            
+                                                            const answeredCount = Object.keys(updatedAnswers).length;
+                                                            
+                                                            if (answeredCount >= totalQ) {
+                                                                // ALL questions answered → combine answers into one message and send
+                                                                const combinedParts: string[] = [];
+                                                                for (let qi = 0; qi < totalQ; qi++) {
+                                                                    const ans = updatedAnswers[qi];
+                                                                    if (ans && ans !== '[skipped]') {
+                                                                        const q = questions[qi];
+                                                                        combinedParts.push(`${q.message} → ${ans}`);
+                                                                    }
+                                                                }
+                                                                const combinedMessage = combinedParts.length > 0
+                                                                    ? combinedParts.join('\n')
+                                                                    : optionText;
+                                                                
+                                                                handleSendMessage({
+                                                                    message: combinedMessage,
+                                                                    files: [],
+                                                                    pastedContent: [],
+                                                                    model: selectedModel,
+                                                                    forceThinking: forceThinking
+                                                                });
+                                                            } else {
+                                                                // Still unanswered questions → auto-advance to next
+                                                                const nextUnanswered = questions.findIndex((_: ClarificationQuestion, qi: number) => qi !== qIdx && !updatedAnswers[qi]);
+                                                                if (nextUnanswered !== -1) {
+                                                                    setActiveClarificationPage(prev => ({ ...prev, [index]: nextUnanswered }));
+                                                                }
+                                                            }
+                                                        };
+                                                        
+                                                        const handleSkipQuestion = (qIdx: number) => {
+                                                            const updatedAnswers: Record<number, string> = {
+                                                                ...(msg.answeredQuestions || {}),
+                                                                [qIdx]: '[skipped]'
+                                                            };
+                                                            
+                                                            setSessions(prev => prev.map(s => {
+                                                                if (s.id === activeSessionId) {
+                                                                    const updatedMsgList = [...s.messages];
+                                                                    const existingMsg = updatedMsgList[index];
+                                                                    updatedMsgList[index] = {
+                                                                        ...existingMsg,
+                                                                        answeredQuestions: updatedAnswers
+                                                                    };
+                                                                    return { ...s, messages: updatedMsgList };
+                                                                }
+                                                                return s;
+                                                            }));
+                                                            
+                                                            const answeredCount = Object.keys(updatedAnswers).length;
+                                                            
+                                                            if (answeredCount >= totalQ) {
+                                                                // All done (some skipped) → send combined
+                                                                const combinedParts: string[] = [];
+                                                                for (let qi = 0; qi < totalQ; qi++) {
+                                                                    const ans = updatedAnswers[qi];
+                                                                    if (ans && ans !== '[skipped]') {
+                                                                        const q = questions[qi];
+                                                                        combinedParts.push(`${q.message} → ${ans}`);
+                                                                    }
+                                                                }
+                                                                if (combinedParts.length > 0) {
+                                                                    handleSendMessage({
+                                                                        message: combinedParts.join('\n'),
+                                                                        files: [],
+                                                                        pastedContent: [],
+                                                                        model: selectedModel,
+                                                                        forceThinking: forceThinking
+                                                                    });
+                                                                }
+                                                            } else {
+                                                                const nextUnanswered = questions.findIndex((_: ClarificationQuestion, qi: number) => qi !== qIdx && !updatedAnswers[qi]);
+                                                                if (nextUnanswered !== -1) {
+                                                                    setActiveClarificationPage(prev => ({ ...prev, [index]: nextUnanswered }));
+                                                                }
+                                                            }
+                                                        };
+                                                        
+                                                        return (
+                                                            <div className={`w-full max-w-2xl mt-2 bg-[#222222] rounded-[20px] border border-[#3c3c3b] shadow-2xl animate-fade-in overflow-hidden font-sans ${allAnswered ? 'opacity-50' : ''}`}>
+                                                                {/* Header */}
+                                                                <div className="flex items-center justify-between gap-4 px-5 pt-5 pb-3">
+                                                                    <h3 className="text-[#ececec] font-medium text-[15px] tracking-tight flex-1 min-w-0">{currentQ.message || "Bạn cần làm rõ điều gì?"}</h3>
+                                                                    <div className="flex items-center gap-2 shrink-0 whitespace-nowrap text-[#7f7f7f] text-xs font-medium">
+                                                                        {totalQ > 1 && (
+                                                                            <>
+                                                                                <button 
+                                                                                    onClick={() => setActiveClarificationPage(prev => ({ ...prev, [index]: Math.max(0, currentPage - 1) }))}
+                                                                                    disabled={currentPage === 0}
+                                                                                    className="hover:text-white transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
+                                                                                >
+                                                                                    <ChevronLeft className="w-3.5 h-3.5" />
+                                                                                </button>
+                                                                                <span className="opacity-60 tabular-nums">{currentPage + 1} of {totalQ}</span>
+                                                                                <button 
+                                                                                    onClick={() => setActiveClarificationPage(prev => ({ ...prev, [index]: Math.min(totalQ - 1, currentPage + 1) }))}
+                                                                                    disabled={currentPage === totalQ - 1}
+                                                                                    className="hover:text-white transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
+                                                                                >
+                                                                                    <ChevronRight className="w-3.5 h-3.5" />
+                                                                                </button>
+                                                                            </>
+                                                                        )}
+                                                                        <button className="hover:text-white transition-colors ml-1">
+                                                                            <X className="w-4 h-4" />
+                                                                        </button>
+                                                                    </div>
+                                                                </div>
+                                                                
+                                                                {/* Answered badge */}
+                                                                {isAnswered && (
+                                                                    <div className="px-5 pb-2">
+                                                                        <span className="inline-flex items-center gap-1.5 text-[12px] text-emerald-400/80 font-medium">
+                                                                            <Check className="w-3.5 h-3.5" />
+                                                                            Đã trả lời: {msg.answeredQuestions![currentPage]}
+                                                                        </span>
+                                                                    </div>
+                                                                )}
+                                                                
+                                                                {/* Options List */}
+                                                                <div className="flex flex-col px-3 pb-2 gap-1.5">
+                                                                    {currentQ.suggestions.map((s: string, i: number) => (
+                                                                        <button
+                                                                            key={`${currentPage}-${i}`}
+                                                                            disabled={isAnswered}
+                                                                            onClick={() => handleSelectOption(s, currentPage)}
+                                                                            className={`group flex items-center justify-between px-3 py-3 rounded-xl text-left transition-all duration-200 ${
+                                                                                isAnswered 
+                                                                                    ? 'bg-[#1e1e1e]/30 cursor-not-allowed' 
+                                                                                    : 'bg-[#1e1e1e]/50 hover:bg-[#2c2c2b] cursor-pointer'
+                                                                            }`}
+                                                                        >
+                                                                            <div className={`flex items-center gap-4 text-[14px] ${isAnswered ? 'text-[#7f7f7f]' : 'text-[#ececec]'}`}>
+                                                                                <span className={`flex items-center justify-center w-6 h-6 shrink-0 rounded-full bg-black/40 text-[11px] font-medium transition-colors ${
+                                                                                    isAnswered ? 'text-[#555]' : 'text-[#7f7f7f] group-hover:text-[#ececec]'
+                                                                                }`}>
+                                                                                    {i + 1}
+                                                                                </span>
+                                                                                {s}
+                                                                            </div>
+                                                                            {!isAnswered && (
+                                                                                <ChevronRight className="w-4 h-4 shrink-0 text-[#7f7f7f] group-hover:text-white transition-colors opacity-0 group-hover:opacity-100 transform translate-x-[-10px] group-hover:translate-x-0 duration-300" />
+                                                                            )}
+                                                                        </button>
+                                                                    ))}
+                                                                </div>
+                                                                
+                                                                {/* Footer: inline "Something else" input + Skip */}
+                                                                <div className="flex items-center justify-between px-5 py-3 border-t border-[#3c3c3b]">
+                                                                    <div className="flex items-center gap-2 flex-1 min-w-0 mr-3">
+                                                                        <Paperclip className="w-4 h-4 shrink-0 text-[#555]" />
+                                                                        <input
+                                                                            type="text"
+                                                                            placeholder="Something else"
+                                                                            disabled={isAnswered}
+                                                                            className="bg-transparent border-none outline-none text-[13px] text-[#ececec] placeholder-[#555] w-full disabled:cursor-not-allowed disabled:opacity-50 font-sans"
+                                                                            onKeyDown={(e) => {
+                                                                                if (e.key === 'Enter' && e.currentTarget.value.trim() && !isAnswered) {
+                                                                                    handleSelectOption(e.currentTarget.value.trim(), currentPage);
+                                                                                    e.currentTarget.value = '';
+                                                                                }
+                                                                            }}
+                                                                        />
+                                                                    </div>
+                                                                    <button 
+                                                                        disabled={isAnswered}
+                                                                        onClick={() => handleSkipQuestion(currentPage)}
+                                                                        className="px-4 py-1.5 text-[13px] text-white/80 border border-[#3c3c3b] hover:bg-white/5 rounded-lg font-medium transition-colors shrink-0 disabled:opacity-40 disabled:cursor-not-allowed"
+                                                                    >
+                                                                        Skip
+                                                                    </button>
+                                                                </div>
+                                                            </div>
+                                                        );
+                                                    })()}
                                                 </div>
                                             )}
                                             
@@ -2099,8 +2423,9 @@ const ChatboxDemo = () => {
                                 selectedModel={selectedModel}
                                 onSelectModel={handleSelectModel}
                                 onOpenModels={fetchModels}
-                                isThinkingEnabled={isThinkingEnabled}
-                                onToggleThinking={() => setIsThinkingEnabled(!isThinkingEnabled)}
+                                forceThinking={forceThinking}
+                                setForceThinking={(v: string | null) => setForceThinking(v as any)}
+                                modelTier={modelTier}
                                 isLoadingModel={isLoadingModel}
                                 loadingModelName={loadingModelName}
                                 isGenerating={isGenerating}
@@ -2180,6 +2505,35 @@ const ChatboxDemo = () => {
                                     </div>
                                 )
                             )}
+                        </div>
+                    </div>
+                </div>
+            )}
+
+            {/* Fullscreen Image Modal */}
+            {fullscreenImage && (
+                <div 
+                    className="fixed inset-0 z-[100] flex items-center justify-center bg-black/80 backdrop-blur-sm animate-fade-in"
+                    onClick={() => setFullscreenImage(null)}
+                >
+                    <div className="relative w-full h-full flex flex-col items-center justify-center p-4 sm:p-8">
+                        <button 
+                            className="absolute top-6 right-6 p-2 rounded-full bg-white/10 hover:bg-white/20 text-white transition-colors"
+                            onClick={(e) => {
+                                e.stopPropagation();
+                                setFullscreenImage(null);
+                            }}
+                        >
+                            <X className="w-6 h-6" />
+                        </button>
+                        <img 
+                            src={typeof fullscreenImage === 'object' && fullscreenImage !== null ? (fullscreenImage as any).url : fullscreenImage as string} 
+                            alt="Fullscreen view" 
+                            className="max-w-full max-h-[75vh] object-contain rounded-lg shadow-2xl"
+                            onClick={(e) => e.stopPropagation()}
+                        />
+                        <div className="mt-4 text-white/70 text-sm font-sans" onClick={(e) => e.stopPropagation()}>
+                            {typeof fullscreenImage === 'object' && fullscreenImage !== null ? (fullscreenImage as any).name : 'Analyzed image'}
                         </div>
                     </div>
                 </div>

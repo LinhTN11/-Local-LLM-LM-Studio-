@@ -162,8 +162,9 @@ interface ModelSelectorProps {
     selectedModel: string;
     onSelect: (modelId: string) => void;
     onOpenModels?: () => void;
-    isThinkingEnabled: boolean;
-    onToggleThinking: () => void;
+    forceThinking: string | null;
+    setForceThinking: (v: string | null) => void;
+    modelTier: string | null;
     isLoadingModel?: boolean;
 }
 
@@ -172,8 +173,9 @@ const ModelSelector: React.FC<ModelSelectorProps> = ({
     selectedModel, 
     onSelect, 
     onOpenModels,
-    isThinkingEnabled, 
-    onToggleThinking,
+    forceThinking, 
+    setForceThinking,
+    modelTier,
     isLoadingModel = false
 }) => {
     const [isOpen, setIsOpen] = useState(false);
@@ -205,7 +207,7 @@ const ModelSelector: React.FC<ModelSelectorProps> = ({
                     setIsOpen(!isOpen);
                 }}
                 disabled={isLoadingModel}
-                className={`inline-flex items-center justify-center relative shrink-0 transition font-sans duration-200 h-9 rounded-xl px-3.5 bg-[#222222]/80 text-[#ececec] hover:bg-[#2c2c2b]/95 border border-[#3c3c3b] select-none text-[13px] gap-1.5 font-medium shadow-sm hover:text-white ${isLoadingModel ? 'opacity-60 cursor-not-allowed' : ''}`}
+                className={`inline-flex items-center justify-center relative shrink-0 transition font-sans duration-200 h-9 rounded-xl px-3.5 bg-[#222222]/80 text-[#ececec] hover:bg-[#2c2c2b]/95 border border-transparent select-none text-[13px] gap-1.5 font-medium hover:text-white ${isLoadingModel ? 'opacity-60 cursor-not-allowed' : ''}`}
             >
                 {isLoadingModel ? (
                     <>
@@ -215,7 +217,7 @@ const ModelSelector: React.FC<ModelSelectorProps> = ({
                 ) : (
                     <>
                         <span className="text-white font-semibold">{currentModel.name}</span>
-                        {isThinkingEnabled && (
+                        {forceThinking !== 'off' && (
                             <span className="text-zinc-400 font-normal ml-0.5">Adaptive</span>
                         )}
                         <Icons.SelectArrow className={`w-3.5 h-3.5 text-zinc-400 opacity-80 shrink-0 transition-transform duration-200 ${isOpen ? 'rotate-180' : ''}`} />
@@ -257,13 +259,16 @@ const ModelSelector: React.FC<ModelSelectorProps> = ({
                             
                             {/* Claude Orange toggle switch */}
                             <button
-                                onClick={onToggleThinking}
+                                onClick={(e) => {
+                                    e.stopPropagation();
+                                    setForceThinking(forceThinking === 'off' ? null : 'off');
+                                }}
                                 className={`relative inline-flex h-5 w-9 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out outline-none select-none
-                                    ${isThinkingEnabled ? 'bg-[#D46B4F]' : 'bg-[#121212] border border-[#3c3c3b]'}`}
+                                    ${forceThinking !== 'off' ? 'bg-[#D46B4F]' : 'bg-[#121212] border border-[#3c3c3b]'}`}
                             >
                                 <span
                                     className={`pointer-events-none inline-block h-4 w-4 transform rounded-full bg-white shadow ring-0 transition duration-200 ease-in-out
-                                        ${isThinkingEnabled ? 'translate-x-4' : 'translate-x-0'}`}
+                                        ${forceThinking !== 'off' ? 'translate-x-4' : 'translate-x-0'}`}
                                 />
                             </button>
                         </div>
@@ -322,14 +327,15 @@ interface ClaudeChatInputProps {
         files: AttachedFile[];
         pastedContent: PastedSnippet[];
         model: string;
-        isThinkingEnabled: boolean;
+        forceThinking: string | null;
     }) => void;
     models?: Model[];
     selectedModel?: string;
     onSelectModel?: (modelId: string) => void;
     onOpenModels?: () => void;
-    isThinkingEnabled: boolean;
-    onToggleThinking: () => void;
+    forceThinking: string | null;
+    setForceThinking: (v: string | null) => void;
+    modelTier: string | null;
     isLoadingModel?: boolean;
     loadingModelName?: string;
     isGenerating?: boolean;
@@ -342,8 +348,9 @@ export const ClaudeChatInput: React.FC<ClaudeChatInputProps> = ({
     selectedModel: propsSelectedModel,
     onSelectModel: propsOnSelectModel,
     onOpenModels,
-    isThinkingEnabled,
-    onToggleThinking,
+    forceThinking,
+    setForceThinking,
+    modelTier,
     isLoadingModel = false,
     loadingModelName = "",
     isGenerating = false,
@@ -384,23 +391,13 @@ export const ClaudeChatInput: React.FC<ClaudeChatInputProps> = ({
             return {
                 id: Math.random().toString(36).substr(2, 9),
                 file,
-                type: isImage ? 'image/unknown' : (file.type || 'application/octet-stream'),
+                type: isImage ? (file.type || 'image/png') : (file.type || 'application/octet-stream'),
                 preview: isImage ? URL.createObjectURL(file) : null,
                 uploadStatus: 'pending'
             };
         });
 
         setFiles(prev => [...prev, ...newFiles]);
-
-        setMessage(prev => {
-            if (prev) return prev;
-            if (newFiles.length === 1) {
-                const f = newFiles[0];
-                if (f.type.startsWith('image/')) return "Analyzed image...";
-                return "Analyzed document...";
-            }
-            return `Analyzed ${newFiles.length} files...`;
-        });
 
         newFiles.forEach(f => {
             setTimeout(() => {
@@ -456,7 +453,7 @@ export const ClaudeChatInput: React.FC<ClaudeChatInputProps> = ({
             files, 
             pastedContent, 
             model: selectedModel,
-            isThinkingEnabled 
+            forceThinking 
         });
         setMessage("");
         setFiles([]);
@@ -481,7 +478,7 @@ export const ClaudeChatInput: React.FC<ClaudeChatInputProps> = ({
             onDrop={onDrop}
         >
             <div className={`
-                !box-content flex flex-col mx-2 md:mx-0 items-stretch transition-all duration-200 relative z-10 rounded-2xl cursor-text border border-[#3c3c3b] 
+                !box-content flex flex-col mx-2 md:mx-0 items-stretch transition-all duration-200 relative z-10 rounded-2xl cursor-text border border-transparent focus-within:border-[#3c3c3b] 
                 shadow-[0_0_15px_rgba(0,0,0,0.08)] hover:shadow-[0_0_20px_rgba(0,0,0,0.12)]
                 bg-[#222222] font-sans antialiased
             `}>
@@ -548,8 +545,9 @@ export const ClaudeChatInput: React.FC<ClaudeChatInputProps> = ({
                                     selectedModel={selectedModel}
                                     onSelect={setSelectedModel}
                                     onOpenModels={onOpenModels}
-                                    isThinkingEnabled={isThinkingEnabled}
-                                    onToggleThinking={onToggleThinking}
+                                    forceThinking={forceThinking}
+                                    setForceThinking={setForceThinking}
+                                    modelTier={modelTier}
                                     isLoadingModel={isLoadingModel}
                                 />
                             </div>
